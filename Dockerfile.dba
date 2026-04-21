@@ -1,0 +1,21 @@
+# Multi-stage build: compiles mysqld_exporter with SSH tunnel support
+# on top of prometheus/mysqld_exporter. Produces a minimal alpine image.
+
+# stage 1: build
+FROM golang:1.25 AS build
+LABEL stage=intermediate
+WORKDIR /app
+COPY . .
+RUN CGO_ENABLED=0 go build -o /app/bin/mysqld_exporter .
+
+# stage 2: runtime
+FROM alpine:3.22.0 AS dist
+LABEL org.opencontainers.image.title="mysqld_exporter.dba"
+LABEL org.opencontainers.image.description="Prometheus mysqld_exporter fork with SSH tunnel support"
+LABEL org.opencontainers.image.source="https://github.com/DiegoDAF/mysqld_exporter.dba"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+COPY --from=build /app/bin/mysqld_exporter /bin/mysqld_exporter
+EXPOSE 9104
+USER nobody
+ENTRYPOINT ["/bin/mysqld_exporter"]

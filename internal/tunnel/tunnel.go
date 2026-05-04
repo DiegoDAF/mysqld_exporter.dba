@@ -4,15 +4,18 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"sync"
 	"time"
 
+	"log/slog"
 	"golang.org/x/crypto/ssh"
 )
 
 // Tunnel represents an active SSH tunnel to a remote host.
+// Tunnels self-heal: if the SSH connection fails on startup or dies later
+// (keepalive failure, network blip), a background reviver goroutine retries
+// attemptConnect with exponential backoff (1s -> 60s) until it succeeds.
 type Tunnel struct {
 	config     SSHTunnelConfig
 	remoteHost string
@@ -28,6 +31,10 @@ type Tunnel struct {
 	mu        sync.RWMutex
 	active    bool
 	lastError error
+
+	// reviverRunning ensures only one reviver goroutine exists per tunnel
+	reviverMu      sync.Mutex
+	reviverRunning bool
 }
 
 // NewTunnel creates a new tunnel instance (but does not start it).
@@ -40,36 +47,52 @@ func NewTunnel(config SSHTunnelConfig, remoteHost string, remotePort int) *Tunne
 	}
 }
 
-// Start establishes the SSH connection and starts the local listener.
+// Start tries to establish the SSH connection. If the first attempt fails,
+// it spawns a reviver goroutine that keeps retrying in the background, so
+// callers can keep the tunnel object and check IsActive() later.
 func (t *Tunnel) Start(ctx context.Context) error {
+	t.mu.Lock()
+	if t.active {
+		t.mu.Unlock()
+		return nil
+	}
+	if t.ctx == nil {
+		t.ctx, t.cancel = context.WithCancel(ctx)
+	}
+	t.mu.Unlock()
+
+	if err := t.attemptConnect(); err != nil {
+		slog.Warn("tunnel", "msg", fmt.Sprintf("tunnel initial connect failed for %s, will retry in background: %v", t.config.Addr(), err))
+		t.spawnReviver()
+		return err
+	}
+	return nil
+}
+
+// attemptConnect performs one SSH dial + listener bind + goroutine setup.
+// On success: sets t.active = true. On failure: returns error, no state changed.
+func (t *Tunnel) attemptConnect() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if t.active {
-		return nil // already running
+		return nil
 	}
 
-	// Create cancellable context
-	t.ctx, t.cancel = context.WithCancel(ctx)
-
-	// Validate config
 	if err := t.config.Validate(); err != nil {
 		return fmt.Errorf("invalid tunnel config: %w", err)
 	}
 
-	// Get auth methods
 	authMethods, err := GetAuthMethods(t.config)
 	if err != nil {
 		return fmt.Errorf("failed to get auth methods: %w", err)
 	}
 
-	// Get host key callback
 	hostKeyCallback, err := GetHostKeyCallback(t.config)
 	if err != nil {
 		return fmt.Errorf("failed to get host key callback: %w", err)
 	}
 
-	// Build SSH client config
 	sshConfig := &ssh.ClientConfig{
 		User:            t.config.User,
 		Auth:            authMethods,
@@ -77,47 +100,90 @@ func (t *Tunnel) Start(ctx context.Context) error {
 		Timeout:         30 * time.Second,
 	}
 
-	// Connect to SSH server
 	sshAddr := t.config.Addr()
-	slog.Info("connecting to SSH server", "addr", sshAddr)
+	slog.Info("tunnel", "msg", fmt.Sprintf("connecting to SSH server %s", sshAddr))
 
 	sshClient, err := ssh.Dial("tcp", sshAddr, sshConfig)
 	if err != nil {
 		t.lastError = err
 		return fmt.Errorf("failed to connect to SSH server %s: %w", sshAddr, err)
 	}
-	t.sshClient = sshClient
 
-	// Start local listener on random port
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		sshClient.Close()
 		t.lastError = err
 		return fmt.Errorf("failed to start local listener: %w", err)
 	}
-	t.listener = listener
 
-	// Extract assigned port
+	t.sshClient = sshClient
+	t.listener = listener
 	t.localPort = listener.Addr().(*net.TCPAddr).Port
 
 	slog.Info("SSH tunnel established",
-		"local_port", t.localPort,
-		"ssh_addr", sshAddr,
-		"remote_host", t.remoteHost,
-		"remote_port", t.remotePort)
+		"local_port", t.localPort, "ssh_addr", sshAddr,
+		"remote_host", t.remoteHost, "remote_port", t.remotePort)
 
-	// Start accept loop in background
 	go t.acceptLoop()
-
-	// Start keepalive if configured
 	if t.config.KeepAliveSeconds > 0 {
 		go t.keepAlive()
 	}
 
 	t.active = true
 	t.lastError = nil
-
 	return nil
+}
+
+// spawnReviver launches a background goroutine that keeps trying to reconnect
+// until the tunnel is active or the context is cancelled. Idempotent — multiple
+// concurrent calls result in only one reviver.
+func (t *Tunnel) spawnReviver() {
+	t.reviverMu.Lock()
+	if t.reviverRunning {
+		t.reviverMu.Unlock()
+		return
+	}
+	t.reviverRunning = true
+	t.reviverMu.Unlock()
+
+	go t.runReviver()
+}
+
+// runReviver retries attemptConnect with exponential backoff (1s, 2s, 4s, ..., 60s capped)
+// until the tunnel is active or the context is cancelled.
+func (t *Tunnel) runReviver() {
+	defer func() {
+		t.reviverMu.Lock()
+		t.reviverRunning = false
+		t.reviverMu.Unlock()
+	}()
+
+	const minBackoff = 1 * time.Second
+	const maxBackoff = 60 * time.Second
+	backoff := minBackoff
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+
+		if t.IsActive() {
+			return
+		}
+
+		if err := t.attemptConnect(); err == nil {
+			slog.Info("tunnel", "msg", fmt.Sprintf("SSH tunnel revived for %s", t.config.Addr()))
+			return
+		} else {
+			slog.Warn("tunnel", "msg", fmt.Sprintf("tunnel reviver failed for %s, retry in %s: %v", t.config.Addr(), backoff, err))
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
 }
 
 // acceptLoop accepts incoming connections and forwards them through the tunnel.
@@ -140,7 +206,7 @@ func (t *Tunnel) acceptLoop() {
 			if t.ctx.Err() != nil {
 				return // context cancelled
 			}
-			slog.Warn("tunnel accept error", "err", err)
+			slog.Warn("tunnel", "msg", fmt.Sprintf("tunnel accept error: %v", err))
 			continue
 		}
 
@@ -158,7 +224,7 @@ func (t *Tunnel) forward(localConn net.Conn) {
 	// Dial remote through SSH
 	remoteConn, err := t.sshClient.Dial("tcp", remoteAddr)
 	if err != nil {
-		slog.Warn("tunnel failed to dial remote, marking inactive", "remote", remoteAddr, "err", err)
+		slog.Warn("tunnel", "msg", fmt.Sprintf("tunnel failed to dial remote %s: %v, marking inactive", remoteAddr, err))
 		t.markInactive()
 		return
 	}
@@ -185,7 +251,7 @@ func (t *Tunnel) forward(localConn net.Conn) {
 
 // keepAlive sends periodic keepalive messages to prevent SSH timeout.
 // After maxKeepaliveFailures consecutive failures, marks the tunnel as inactive
-// so that the next GetOrCreate call will reconnect automatically.
+// and triggers the reviver to attempt reconnection in the background.
 func (t *Tunnel) keepAlive() {
 	const maxKeepaliveFailures = 3
 
@@ -202,9 +268,9 @@ func (t *Tunnel) keepAlive() {
 			_, _, err := t.sshClient.SendRequest("keepalive@openssh.com", true, nil)
 			if err != nil {
 				failures++
-				slog.Warn("SSH keepalive failed", "failures", failures, "max", maxKeepaliveFailures, "err", err)
+				slog.Warn("tunnel", "msg", fmt.Sprintf("SSH keepalive failed (%d/%d): %v", failures, maxKeepaliveFailures, err))
 				if failures >= maxKeepaliveFailures {
-					slog.Warn("SSH tunnel dead, marking inactive", "addr", t.config.Addr(), "failures", failures)
+					slog.Warn("tunnel", "msg", fmt.Sprintf("SSH tunnel to %s dead after %d keepalive failures, marking inactive", t.config.Addr(), failures))
 					t.markInactive()
 					return
 				}
@@ -215,11 +281,22 @@ func (t *Tunnel) keepAlive() {
 	}
 }
 
-// markInactive marks the tunnel as dead so GetOrCreate will reconnect on next scrape.
+// markInactive marks the tunnel as dead and triggers the reviver to reconnect.
+// Called when SSH dial fails (forward) or keepalive declares the tunnel dead.
 func (t *Tunnel) markInactive() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.active = false
+	// Close the broken SSH client and listener so attemptConnect can rebuild fresh
+	if t.sshClient != nil {
+		_ = t.sshClient.Close()
+		t.sshClient = nil
+	}
+	if t.listener != nil {
+		_ = t.listener.Close()
+		t.listener = nil
+	}
+	t.mu.Unlock()
+	t.spawnReviver()
 }
 
 // Close stops the tunnel and releases resources.
@@ -231,7 +308,7 @@ func (t *Tunnel) Close() error {
 		return nil
 	}
 
-	// Cancel context to stop goroutines
+	// Cancel context to stop goroutines (including reviver)
 	if t.cancel != nil {
 		t.cancel()
 	}
@@ -254,7 +331,7 @@ func (t *Tunnel) Close() error {
 
 	t.active = false
 
-	slog.Info("SSH tunnel closed", "local_port", t.localPort)
+	slog.Info("tunnel", "msg", fmt.Sprintf("SSH tunnel closed: 127.0.0.1:%d", t.localPort))
 
 	if len(errs) > 0 {
 		return fmt.Errorf("tunnel close errors: %v", errs)

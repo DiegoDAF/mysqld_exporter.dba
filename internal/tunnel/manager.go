@@ -3,8 +3,9 @@ package tunnel
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"sync"
+
+	"log/slog"
 )
 
 // Manager manages multiple SSH tunnels.
@@ -23,30 +24,34 @@ func NewManager(ctx context.Context) *Manager {
 }
 
 // GetOrCreate returns an existing tunnel or creates a new one.
+//
+// Tunnel objects are kept across Start failures: a Tunnel that failed to
+// establish on first attempt has a background reviver running, and will
+// become active automatically when SSH connectivity is restored.
+//
+// On error, the tunnel object is still returned (and stored) so that the
+// caller can hold a reference and check IsActive() on subsequent calls.
 func (m *Manager) GetOrCreate(serviceID string, config SSHTunnelConfig, remoteHost string, remotePort int) (*Tunnel, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Check if tunnel already exists
+	// Existing tunnel: return as-is. If inactive, its reviver is already retrying.
 	if t, exists := m.tunnels[serviceID]; exists {
 		if t.IsActive() {
 			return t, nil
 		}
-		// Tunnel exists but not active, remove it
-		t.Close()
-		delete(m.tunnels, serviceID)
+		return t, fmt.Errorf("tunnel for service %s is not yet active (reviver running)", serviceID)
 	}
 
-	// Create new tunnel
+	// New tunnel
 	t := NewTunnel(config, remoteHost, remotePort)
-
-	// Start the tunnel
-	if err := t.Start(m.ctx); err != nil {
-		return nil, fmt.Errorf("failed to start tunnel for service %s: %w", serviceID, err)
-	}
-
-	// Store and return
+	// Store BEFORE Start so the tunnel survives even if first connect fails —
+	// the reviver inside will keep retrying and the next GetOrCreate will find it.
 	m.tunnels[serviceID] = t
+
+	if err := t.Start(m.ctx); err != nil {
+		return t, fmt.Errorf("failed to start tunnel for service %s (will retry in background): %w", serviceID, err)
+	}
 	return t, nil
 }
 
@@ -80,6 +85,7 @@ func (m *Manager) CloseAll() error {
 	defer m.mu.Unlock()
 
 	var errs []error
+	total := len(m.tunnels)
 
 	for serviceID, t := range m.tunnels {
 		if err := t.Close(); err != nil {
@@ -87,11 +93,10 @@ func (m *Manager) CloseAll() error {
 		}
 	}
 
-	total := len(m.tunnels)
 	// Clear map
 	m.tunnels = make(map[string]*Tunnel)
 
-	slog.Info("closed all SSH tunnels", "total", total)
+	slog.Info("tunnel", "msg", fmt.Sprintf("closed all SSH tunnels (%d total)", total))
 
 	if len(errs) > 0 {
 		return fmt.Errorf("errors closing tunnels: %v", errs)
